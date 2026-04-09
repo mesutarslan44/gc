@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Dimensions, PanResponder, InteractionManager, Platform, Animated } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics'; // Use full import for constants
@@ -21,8 +21,11 @@ import {
     calculateCombat,
     getTroopsToSend,
     calculateTravelTime,
+    getPlanetRegenAmount,
     makeAIDecision,
+    makeAIWaveDecisions,
     makeAllAIDecisions,
+    getAITickRate,
     checkGameState
 } from '../game/gameLogic';
 import { generatePowerUp, hasActivePowerUp, POWER_UP_TYPES } from '../game/powerUps';
@@ -35,6 +38,66 @@ import soundManager from '../utils/SoundManager';
 
 const { width, height } = Dimensions.get('window');
 const TUTORIAL_KEY = '@galaxy_conquest_tutorial_done';
+
+const buildLinkKey = (a, b) => [a, b].sort().join('::');
+
+const getDistance = (a, b) => {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+};
+
+const buildPlanetLinks = (planets) => {
+    if (!planets || planets.length < 2) return [];
+
+    const idToPlanet = new Map(planets.map(planet => [planet.id, planet]));
+    const links = new Set();
+    const addLink = (fromId, toId) => {
+        if (fromId === toId) return;
+        links.add(buildLinkKey(fromId, toId));
+    };
+
+    const connected = new Set([planets[0].id]);
+    while (connected.size < planets.length) {
+        let best = null;
+        planets.forEach(from => {
+            if (!connected.has(from.id)) return;
+            planets.forEach(to => {
+                if (connected.has(to.id)) return;
+                const distance = getDistance(from, to);
+                if (!best || distance < best.distance) {
+                    best = { fromId: from.id, toId: to.id, distance };
+                }
+            });
+        });
+
+        if (!best) break;
+        addLink(best.fromId, best.toId);
+        connected.add(best.toId);
+    }
+
+    const extraNeighbors = planets.length >= 9 ? 3 : 2;
+    planets.forEach(from => {
+        const nearest = planets
+            .filter(to => to.id !== from.id)
+            .map(to => ({ id: to.id, distance: getDistance(from, to) }))
+            .sort((a, b) => a.distance - b.distance)
+            .slice(0, extraNeighbors);
+
+        nearest.forEach(target => addLink(from.id, target.id));
+    });
+
+    return Array.from(links).map((key) => {
+        const [fromId, toId] = key.split('::');
+        const from = idToPlanet.get(fromId);
+        const to = idToPlanet.get(toId);
+        return {
+            fromId,
+            toId,
+            distance: from && to ? getDistance(from, to) : 0,
+        };
+    });
+};
 
 const GameScreen = ({ route, navigation }) => {
     const levelId = route?.params?.levelId || 1;
@@ -94,9 +157,12 @@ const GameScreen = ({ route, navigation }) => {
     const [activeShipEmoji, setActiveShipEmoji] = useState('🚀');
     const [activeTheme, setActiveTheme] = useState(null);
     const [themeColors, setThemeColors] = useState(theme.colors);
+    const [impactFlash, setImpactFlash] = useState(null);
 
     // Animation refs
     const pulseAnim = useRef(new Animated.Value(1)).current;
+    const cameraShakeAnim = useRef(new Animated.Value(0)).current;
+    const battlefieldZoomAnim = useRef(new Animated.Value(1)).current;
     const dragStartRef = useRef(null);
 
     const aiIntervalRef = useRef(null);
@@ -113,6 +179,7 @@ const GameScreen = ({ route, navigation }) => {
     const isDraggingRef = useRef(isDragging);
     const activePowerUpsRef = useRef(activePowerUps);
     const gameAreaLayoutRef = useRef(gameAreaLayout);
+    const linkSetRef = useRef(new Set());
 
     // Keep refs in sync with state
     useEffect(() => { planetsRef.current = planets; }, [planets]);
@@ -120,6 +187,69 @@ const GameScreen = ({ route, navigation }) => {
     useEffect(() => { isDraggingRef.current = isDragging; }, [isDragging]);
     useEffect(() => { activePowerUpsRef.current = activePowerUps; }, [activePowerUps]);
     useEffect(() => { gameAreaLayoutRef.current = gameAreaLayout; }, [gameAreaLayout]);
+
+    const primarySelectedPlanet = useMemo(
+        () => selectedPlanets[0] || selectedPlanet || null,
+        [selectedPlanet, selectedPlanets]
+    );
+
+    const planetById = useMemo(() => {
+        const byId = new Map();
+        planets.forEach((planet) => byId.set(planet.id, planet));
+        return byId;
+    }, [planets]);
+
+    const planetLinks = useMemo(() => buildPlanetLinks(planets), [planets]);
+
+    const linkSet = useMemo(() => {
+        const set = new Set();
+        planetLinks.forEach((link) => {
+            set.add(buildLinkKey(link.fromId, link.toId));
+        });
+        return set;
+    }, [planetLinks]);
+
+    useEffect(() => {
+        linkSetRef.current = linkSet;
+    }, [linkSet]);
+
+    const arePlanetsLinked = useCallback((fromId, toId) => {
+        if (!fromId || !toId || fromId === toId) return false;
+        return linkSet.has(buildLinkKey(fromId, toId));
+    }, [linkSet]);
+
+    const canSendFromTo = useCallback((sourcePlanet, targetPlanet) => {
+        if (!sourcePlanet || !targetPlanet) return false;
+        if (sourcePlanet.id === targetPlanet.id) return false;
+        if (sourcePlanet.troops <= 1) return false;
+        return arePlanetsLinked(sourcePlanet.id, targetPlanet.id);
+    }, [arePlanetsLinked]);
+
+    const battlefieldStats = useMemo(() => {
+        const ownedByPlayer = planets.filter(p => p.owner === 'player').length;
+        const ownedByEnemies = planets.filter(p => p.owner !== 'player' && p.owner !== 'neutral').length;
+        const neutralPlanets = planets.filter(p => p.owner === 'neutral').length;
+        const playerTroops = planets.filter(p => p.owner === 'player').reduce((sum, p) => sum + p.troops, 0);
+        const enemyTroops = planets.filter(p => p.owner !== 'player' && p.owner !== 'neutral').reduce((sum, p) => sum + p.troops, 0);
+
+        return {
+            ownedByPlayer,
+            ownedByEnemies,
+            neutralPlanets,
+            playerTroops,
+            enemyTroops,
+        };
+    }, [planets]);
+
+    const battleSummary = useMemo(() => {
+        const elapsedMs = Date.now() - gameStats.startTime;
+        const minutes = Math.floor(elapsedMs / 60000);
+        const seconds = Math.floor((elapsedMs % 60000) / 1000);
+        return {
+            elapsedLabel: `${minutes}:${String(seconds).padStart(2, '0')}`,
+            efficiency: shipsSent > 0 ? Math.round((gameStats.planetsCaptured / shipsSent) * 100) : 0,
+        };
+    }, [gameStats.planetsCaptured, gameStats.startTime, shipsSent]);
 
     // Helper to find planet at position - increased threshold for cross-device compatibility
     const findPlanetAt = (x, y, playerOnly = false) => {
@@ -144,8 +274,42 @@ const GameScreen = ({ route, navigation }) => {
         setDragLine(null);
         setHoverTarget(null);
         setSelectedPlanets([]);
+        setSelectedPlanet(null);
         dragStartRef.current = null;
     };
+
+    const applySelection = useCallback((nextPlanets) => {
+        setSelectedPlanets(nextPlanets);
+        setSelectedPlanet(nextPlanets[0] || null);
+    }, []);
+
+    const clearSelection = useCallback(() => {
+        setHoverTarget(null);
+        setSelectedPlanets([]);
+        setSelectedPlanet(null);
+    }, []);
+
+    const sendSelectionToTarget = useCallback((targetPlanet, sourcesOverride = null) => {
+        const sourcePlanets = sourcesOverride || selectedPlanetsRef.current;
+        if (!targetPlanet || !sourcePlanets.length) {
+            return;
+        }
+
+        const validSources = sourcePlanets.filter(sourcePlanet => canSendFromTo(sourcePlanet, targetPlanet));
+        if (!validSources.length) {
+            hapticsManager.notification(Haptics.NotificationFeedbackType.Warning);
+            clearSelection();
+            return;
+        }
+
+        hapticsManager.impact(Haptics.ImpactFeedbackStyle.Medium);
+
+        validSources.forEach(sourcePlanet => {
+            sendShips(sourcePlanet.id, targetPlanet.id, 'player');
+        });
+
+        clearSelection();
+    }, [canSendFromTo, clearSelection]);
 
     // PanResponder for drag gesture - Optimized for all devices
     const panResponder = useRef(
@@ -172,7 +336,7 @@ const GameScreen = ({ route, navigation }) => {
                     hapticsManager.selection();
                     dragStartRef.current = touchedPlanet;
                     setIsDragging(true);
-                    setSelectedPlanets([touchedPlanet]);
+                    applySelection([touchedPlanet]);
                     // Planet x,y are center coordinates
                     setDragLine({
                         fromX: touchedPlanet.x,
@@ -194,16 +358,14 @@ const GameScreen = ({ route, navigation }) => {
 
                 setDragLine(prev => prev ? { ...prev, toX: touchX, toY: touchY } : null);
 
-                // Check if passing over other player planets to add them
-                const hoverPlayerPlanet = findPlanetAt(touchX, touchY, true);
-                if (hoverPlayerPlanet && !selectedPlanetsRef.current.find(p => p.id === hoverPlayerPlanet.id)) {
-                    Haptics.selectionAsync();
-                    setSelectedPlanets(prev => [...prev, hoverPlayerPlanet]);
-                }
-
-                // Check for ANY planet (target highlight)
+                // Little Wars hissi icin drag sirasinda otomatik multi-select yapmiyoruz.
+                // Sadece hedef highlight oluyor; ek secim long press ile yapiliyor.
                 const anyHoverPlanet = findPlanetAt(touchX, touchY, false);
-                if (anyHoverPlanet && !selectedPlanetsRef.current.find(p => p.id === anyHoverPlanet.id)) {
+                const hasLinkedSource = anyHoverPlanet && selectedPlanetsRef.current.some((sourcePlanet) => {
+                    if (sourcePlanet.id === anyHoverPlanet.id || sourcePlanet.troops <= 1) return false;
+                    return linkSetRef.current.has(buildLinkKey(sourcePlanet.id, anyHoverPlanet.id));
+                });
+                if (anyHoverPlanet && hasLinkedSource && !selectedPlanetsRef.current.find(p => p.id === anyHoverPlanet.id)) {
                     setHoverTarget(anyHoverPlanet.id);
                 } else {
                     setHoverTarget(null);
@@ -225,12 +387,18 @@ const GameScreen = ({ route, navigation }) => {
                 const targetPlanet = findPlanetAt(touchX, touchY, false);
 
                 if (targetPlanet && selectedPlanetsRef.current.length > 0) {
-                    hapticsManager.impact(Haptics.ImpactFeedbackStyle.Medium);
-                    selectedPlanetsRef.current.forEach(sourcePlanet => {
-                        if (sourcePlanet.id !== targetPlanet.id && sourcePlanet.troops > 1) {
-                            sendShips(sourcePlanet.id, targetPlanet.id, 'player');
-                        }
+                    const validSources = selectedPlanetsRef.current.filter((sourcePlanet) => {
+                        if (sourcePlanet.id === targetPlanet.id || sourcePlanet.troops <= 1) return false;
+                        return linkSetRef.current.has(buildLinkKey(sourcePlanet.id, targetPlanet.id));
                     });
+                    if (validSources.length > 0) {
+                        hapticsManager.impact(Haptics.ImpactFeedbackStyle.Medium);
+                        validSources.forEach(sourcePlanet => {
+                            sendShips(sourcePlanet.id, targetPlanet.id, 'player');
+                        });
+                    } else {
+                        hapticsManager.notification(Haptics.NotificationFeedbackType.Warning);
+                    }
                 }
 
                 cleanupDragState();
@@ -265,8 +433,8 @@ const GameScreen = ({ route, navigation }) => {
                 }
             }
 
-            // Show level intro for first 5 levels (after tutorial is done)
-            if (levelId <= 5 && LEVEL_INTROS[levelId]) {
+            // Show level intro for levels that have a defined tip card
+            if (LEVEL_INTROS[levelId]) {
                 setShowLevelIntro(true);
             }
         };
@@ -278,6 +446,7 @@ const GameScreen = ({ route, navigation }) => {
         if (level) {
             setPlanets(level.planets.map(p => ({ ...p })));
             setGameState('playing');
+            setSelectedPlanets([]);
             setSelectedPlanet(null);
             setShips([]);
             setPowerUps([]);
@@ -485,18 +654,21 @@ const GameScreen = ({ route, navigation }) => {
                 if (p.owner !== 'neutral') {
                     // Check for regen power-up using ref for stability
                     const hasRegen = activePowerUpsRef.current.some(pu => pu.id === 'regen' && Date.now() < pu.expiresAt);
-                    // FIX: Only player gets the regen bonus!
-                    const regenAmount = (hasRegen && p.owner === 'player') ? 3 : 1;
+                    const regenAmount = getPlanetRegenAmount(p, hasRegen);
                     return { ...p, troops: p.troops + regenAmount };
                 }
                 return p;
             }));
-        }, 1500); // Fixed interval
+        }, 1600);
 
         return () => clearInterval(regenIntervalRef.current);
     }, [gameState, showTutorial]); // Removed activePowerUps from deps
 
-    // AI logic - uses ref to avoid resetting interval on every planets change
+    const enemyTickRate = useMemo(() => {
+        return level ? getAITickRate(level, planets, 'enemy') : 2200;
+    }, [level, planets]);
+
+    // AI logic - uses ref to avoid stale closures while still adapting to battlefield state
     useEffect(() => {
         if (!level || showTutorial) return;
 
@@ -513,16 +685,24 @@ const GameScreen = ({ route, navigation }) => {
                     sendShips(decision.from, decision.to, decision.owner);
                 });
             } else {
-                // Classic mode
-                const decision = makeAIDecision(planetsRef.current);
-                if (decision) {
-                    sendShips(decision.from, decision.to, 'enemy');
+                const waveDecisions = makeAIWaveDecisions(planetsRef.current, 'enemy', false);
+                if (waveDecisions.length) {
+                    waveDecisions.forEach((decision, index) => {
+                        setTimeout(() => {
+                            sendShips(decision.from, decision.to, 'enemy');
+                        }, index * 220);
+                    });
+                } else {
+                    const decision = makeAIDecision(planetsRef.current);
+                    if (decision) {
+                        sendShips(decision.from, decision.to, 'enemy');
+                    }
                 }
             }
-        }, level.aiSpeed);
+        }, enemyTickRate);
 
         return () => clearInterval(aiIntervalRef.current);
-    }, [gameState, level, showTutorial, freeForAll]); // Removed planets from deps - use ref instead
+    }, [gameState, level, showTutorial, freeForAll, enemyTickRate]);
 
     // Check win/lose
     useEffect(() => {
@@ -611,6 +791,31 @@ const GameScreen = ({ route, navigation }) => {
         setExplosions(prev => prev.filter(e => e.id !== id));
     };
 
+    const triggerCameraShake = useCallback((intensity = 1) => {
+        const amplitude = Math.max(4, Math.min(12, intensity * 5));
+        Animated.sequence([
+            Animated.timing(cameraShakeAnim, { toValue: amplitude, duration: 40, useNativeDriver: true }),
+            Animated.timing(cameraShakeAnim, { toValue: -amplitude * 0.7, duration: 45, useNativeDriver: true }),
+            Animated.timing(cameraShakeAnim, { toValue: amplitude * 0.35, duration: 35, useNativeDriver: true }),
+            Animated.timing(cameraShakeAnim, { toValue: 0, duration: 35, useNativeDriver: true }),
+        ]).start();
+    }, [cameraShakeAnim]);
+
+    const triggerBattlefieldZoom = useCallback((targetScale = 1.02) => {
+        Animated.sequence([
+            Animated.timing(battlefieldZoomAnim, { toValue: targetScale, duration: 100, useNativeDriver: true }),
+            Animated.timing(battlefieldZoomAnim, { toValue: 1, duration: 160, useNativeDriver: true }),
+        ]).start();
+    }, [battlefieldZoomAnim]);
+
+    const triggerImpactFlash = useCallback((x, y, color) => {
+        const id = `flash-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        setImpactFlash({ id, x, y, color });
+        setTimeout(() => {
+            setImpactFlash(current => (current?.id === id ? null : current));
+        }, 220);
+    }, []);
+
     const collectPowerUp = (powerUp) => {
         hapticsManager.impact(Haptics.ImpactFeedbackStyle.Medium);
 
@@ -642,155 +847,46 @@ const GameScreen = ({ route, navigation }) => {
     };
 
     const handlePlanetPress = (planet) => {
-        if (showTutorial) return;
+        if (showTutorial || gameState !== 'playing') return;
         Haptics.selectionAsync();
 
-        // If we have planets selected
         if (selectedPlanets.length > 0) {
-            // Check if this planet is already in selection
             const isAlreadySelected = selectedPlanets.find(p => p.id === planet.id);
+            const isOwnPlanet = planet.owner === 'player' && planet.troops > 1;
 
             if (isAlreadySelected) {
-                // TOGGLE: Remove from selection (deselect)
-                const newSelection = selectedPlanets.filter(p => p.id !== planet.id);
-                setSelectedPlanets(newSelection);
-                if (newSelection.length === 0) {
-                    setSelectedPlanet(null);
+                applySelection(selectedPlanets.filter(p => p.id !== planet.id));
+            } else if (isOwnPlanet) {
+                if (!selectedPlanets.length || selectedPlanets.some(source => arePlanetsLinked(source.id, planet.id))) {
+                    applySelection([...selectedPlanets, planet]);
                 } else {
-                    setSelectedPlanet(newSelection[0]);
+                    hapticsManager.notification(Haptics.NotificationFeedbackType.Warning);
                 }
             } else {
-                // Planet is NOT in selection - SEND troops to it (works for own planets too!)
-                hapticsManager.impact(Haptics.ImpactFeedbackStyle.Medium);
-                selectedPlanets.forEach(sourcePlanet => {
-                    if (sourcePlanet.id !== planet.id && sourcePlanet.troops > 1) {
-                        sendShips(sourcePlanet.id, planet.id, 'player');
-                    }
-                });
-                setSelectedPlanets([]);
-                setSelectedPlanet(null);
+                sendSelectionToTarget(planet, selectedPlanets);
             }
+
             return;
         }
 
-        // Single select mode (backward compatible)
-        if (selectedPlanet) {
-            if (selectedPlanet.id !== planet.id && selectedPlanet.owner === 'player') {
-                sendShips(selectedPlanet.id, planet.id, 'player');
-            }
-            setSelectedPlanet(null);
-        } else {
-            if (planet.owner === 'player' && planet.troops > 1) {
-                setSelectedPlanet(planet);
-                // Also add to multi-select for the new system
-                setSelectedPlanets([planet]);
-            }
+        if (planet.owner === 'player' && planet.troops > 1) {
+            applySelection([planet]);
         }
     };
 
-    // Long press: Add planet to multi-selection
     const handlePlanetLongPress = (planet) => {
         if (showTutorial || gameState !== 'playing') return;
         if (planet.owner !== 'player' || planet.troops <= 1) return;
 
         hapticsManager.impact(Haptics.ImpactFeedbackStyle.Light);
 
-        // Add to selection if not already there
         if (!selectedPlanets.find(p => p.id === planet.id)) {
-            setSelectedPlanets(prev => [...prev, planet]);
-            if (!selectedPlanet) {
-                setSelectedPlanet(planet);
+            if (selectedPlanets.length > 0 && !selectedPlanets.some(source => arePlanetsLinked(source.id, planet.id))) {
+                hapticsManager.notification(Haptics.NotificationFeedbackType.Warning);
+                return;
             }
+            applySelection([...selectedPlanets, planet]);
         }
-    };
-
-    // Send ships from multiple selected planets to one target
-    const sendFromMultiplePlanets = (targetPlanet) => {
-        if (selectedPlanets.length === 0) return;
-
-        hapticsManager.impact(Haptics.ImpactFeedbackStyle.Medium);
-
-        selectedPlanets.forEach(sourcePlanet => {
-            if (sourcePlanet.id !== targetPlanet.id && sourcePlanet.troops > 1) {
-                sendShips(sourcePlanet.id, targetPlanet.id, 'player');
-            }
-        });
-
-        setSelectedPlanets([]);
-    };
-
-    // Find planet at given coordinates
-    const findPlanetAtPosition = (x, y) => {
-        return planets.find(planet => {
-            const dx = x - planet.x - 30; // Account for planet center
-            const dy = y - planet.y - 30;
-            const distance = Math.sqrt(dx * dx + dy * dy);
-            return distance < (planet.size || 50);
-        });
-    };
-
-    // Handle drag start on a planet
-    const handleDragStart = (planet, gestureState) => {
-        if (showTutorial || gameState !== 'playing') return;
-        if (planet.owner !== 'player' || planet.troops <= 1) return;
-
-        hapticsManager.selection();
-        dragStartRef.current = planet;
-        setIsDragging(true);
-
-        // Add to multi-select if not already selected
-        if (!selectedPlanets.find(p => p.id === planet.id)) {
-            setSelectedPlanets(prev => [...prev, planet]);
-        }
-
-        setDragLine({
-            fromX: planet.x + 25,
-            fromY: planet.y + 25,
-            toX: planet.x + 25,
-            toY: planet.y + 25
-        });
-    };
-
-    // Handle drag move
-    const handleDragMove = (gestureState) => {
-        if (!isDragging || !dragStartRef.current) return;
-
-        // Use dynamic game area offset instead of hardcoded value
-        const touchX = gestureState.moveX - gameAreaLayout.x;
-        const touchY = gestureState.moveY - gameAreaLayout.y;
-
-        setDragLine(prev => prev ? { ...prev, toX: touchX, toY: touchY } : null);
-
-        setDragLine(prev => prev ? { ...prev, toX: touchX, toY: touchY } : null);
-
-        // Highlight potential target but DO NOT add to selection automatically
-        // This fixes the issue where dragging across planets selects them all
-        const hoverPlanet = findPlanetAtPosition(touchX, touchY);
-        if (hoverPlanet && hoverPlanet.id !== dragStartRef.current?.id) {
-            setHoverTarget(hoverPlanet.id);
-        } else {
-            setHoverTarget(null);
-        }
-    };
-
-    // Handle drag end
-    const handleDragEnd = (gestureState) => {
-        if (!isDragging) return;
-
-        // Use dynamic game area offset instead of hardcoded value
-        const touchX = gestureState.moveX - gameAreaLayout.x;
-        const touchY = gestureState.moveY - gameAreaLayout.y;
-
-        const targetPlanet = findPlanetAtPosition(touchX, touchY);
-
-        if (targetPlanet && selectedPlanets.length > 0) {
-            // Send from all selected planets to target
-            sendFromMultiplePlanets(targetPlanet);
-        }
-
-        setIsDragging(false);
-        setDragLine(null);
-        dragStartRef.current = null;
     };
 
     const sendShips = (fromId, toId, owner) => {
@@ -801,9 +897,14 @@ const GameScreen = ({ route, navigation }) => {
 
         if (!fromPlanet || !toPlanet) return;
         if (fromPlanet.owner !== owner) return;
+        if (!linkSetRef.current.has(buildLinkKey(fromId, toId))) return;
 
-        const troopsToSend = getTroopsToSend(fromPlanet.troops);
+        const troopsToSend = getTroopsToSend(fromPlanet.troops, {
+            aggressive: owner !== 'player',
+        });
         if (troopsToSend < 1) return;
+
+        triggerBattlefieldZoom(owner === 'player' ? 1.015 : 1.01);
 
         // Play attack sound for player
         if (owner === 'player') {
@@ -857,6 +958,7 @@ const GameScreen = ({ route, navigation }) => {
                 if (hasShield && targetPlanet.owner === 'player' && shipToUse.owner !== 'player') {
                     shieldReduction = 10;
                     addExplosion(targetPlanet.x, targetPlanet.y, '#00d4ff', 'small');
+                    triggerImpactFlash(targetPlanet.x, targetPlanet.y, '#7ce5ff');
                 }
 
                 // Use the CURRENT power-up status (after any in-flight updates)
@@ -869,12 +971,16 @@ const GameScreen = ({ route, navigation }) => {
                 if (isProtected) {
                     // During protection, attacks do nothing
                     addExplosion(targetPlanet.x, targetPlanet.y, '#00d4ff', 'small');
+                    triggerImpactFlash(targetPlanet.x, targetPlanet.y, '#7ce5ff');
                     return prev.filter(s => s.id !== ship.id);
                 }
 
                 setPlanets(prevPlanets => prevPlanets.map(p => {
                     if (p.id === shipToUse.targetId) {
                         const result = calculateCombat(effectiveTroops, p.troops, shipToUse.owner, p.owner);
+                        const clashPower = Math.max(1, effectiveTroops / 18);
+                        triggerCameraShake(result.newOwner !== p.owner ? clashPower * 1.2 : clashPower * 0.8);
+                        triggerBattlefieldZoom(result.newOwner !== p.owner ? 1.03 : 1.018);
 
                         if (result.newOwner !== p.owner) {
                             if (shipToUse.owner === 'player' && p.owner !== 'player') {
@@ -885,6 +991,11 @@ const GameScreen = ({ route, navigation }) => {
                                 ? (activeTheme ? activeTheme.colors.player : theme.colors.player)
                                 : (currentThemeColors && currentThemeColors[shipToUse.owner] ? currentThemeColors[shipToUse.owner] : theme.colors.enemy);
                             addExplosion(p.x, p.y, explosionColor, p.isBoss ? 'large' : 'medium');
+                            triggerImpactFlash(p.x, p.y, explosionColor);
+                        } else if (effectiveTroops > 0) {
+                            const clashColor = shipToUse.owner === 'player' ? '#7ce5ff' : '#ff9a9a';
+                            addExplosion(p.x, p.y, clashColor, 'small');
+                            triggerImpactFlash(p.x, p.y, clashColor);
                         }
 
                         return { ...p, owner: result.newOwner, troops: result.remainingTroops };
@@ -917,6 +1028,7 @@ const GameScreen = ({ route, navigation }) => {
     const handleRetry = () => {
         setPlanets(level.planets.map(p => ({ ...p })));
         setGameState('playing');
+        setSelectedPlanets([]);
         setSelectedPlanet(null);
         setShips([]);
         setPowerUps([]);
@@ -962,13 +1074,18 @@ const GameScreen = ({ route, navigation }) => {
                     </TouchableOpacity>
                     <View style={styles.headerCenter}>
                         <Text style={styles.levelTitle}>{level?.name || 'Seviye'}</Text>
-                        <Text style={styles.scoreText}>⭐ {score}</Text>
-                        {/* Protection Banner - Enhanced Visibility */}
+                        <View style={styles.headerStatsRow}>
+                            <Text style={styles.scoreText}>⭐ {score}</Text>
+                            <View style={styles.headerMiniDivider} />
+                            <Text style={styles.headerStatChip}>🪐 {battlefieldStats.ownedByPlayer}</Text>
+                            <Text style={styles.headerStatChip}>⚔️ {battlefieldStats.ownedByEnemies}</Text>
+                            <Text style={styles.headerStatChip}>👥 {battlefieldStats.playerTroops}</Text>
+                        </View>
                         {protectionCountdown > 0 && (
                             <Animated.View style={[styles.protectionContainer, { transform: [{ scale: pulseAnim }] }]}>
-                                <Text style={styles.protectionText}>🛡️ KORUMA AKTİF! 🛡️</Text>
+                                <Text style={styles.protectionText}>🛡️ Koruma aktif</Text>
                                 <Text style={styles.protectionHint}>
-                                    Saldırılar {protectionCountdown}s kilitli
+                                    Saldırılar {protectionCountdown}s daha kapalı
                                 </Text>
                             </Animated.View>
                         )}
@@ -1008,38 +1125,86 @@ const GameScreen = ({ route, navigation }) => {
                         });
                     }}
                 >
-                    {/* Power-ups */}
-                    {powerUps.map(powerUp => (
-                        <PowerUp
-                            key={powerUp.id}
-                            x={powerUp.x}
-                            y={powerUp.y}
-                            type={powerUp.type}
-                            onCollect={() => collectPowerUp(powerUp)}
-                        />
-                    ))}
+                    <Animated.View
+                        pointerEvents="box-none"
+                        style={[
+                            styles.battlefieldLayer,
+                            {
+                                transform: [
+                                    { translateX: cameraShakeAnim },
+                                    { scale: battlefieldZoomAnim },
+                                ],
+                            },
+                        ]}
+                    >
+                        {/* Power-ups */}
+                        {powerUps.map(powerUp => (
+                            <PowerUp
+                                key={powerUp.id}
+                                x={powerUp.x}
+                                y={powerUp.y}
+                                type={powerUp.type}
+                                onCollect={() => collectPowerUp(powerUp)}
+                            />
+                        ))}
 
-                    {/* Planets */}
-                    {planets.map(planet => (
-                        <Planet
-                            key={planet.id}
-                            x={planet.x}
-                            y={planet.y}
-                            troops={planet.troops}
-                            owner={planet.owner}
-                            size={planet.size}
-                            isBoss={planet.isBoss}
-                            isSelected={selectedPlanet?.id === planet.id || selectedPlanets.some(p => p.id === planet.id)}
-                            isHoverTarget={hoverTarget === planet.id}
-                            hasShield={
-                                (planet.owner === 'player' && activePowerUps.some(p => p.id === 'shield' && Date.now() < p.expiresAt)) ||
-                                (protectionCountdown > 0) // Also show shield during level start protection
-                            }
-                            onPress={() => handlePlanetPress(planet)}
-                            onLongPress={() => handlePlanetLongPress(planet)}
-                            themeColors={currentThemeColors}
-                        />
-                    ))}
+                        {/* Planet link network */}
+                        {planetLinks.map((link) => {
+                            const fromPlanet = planetById.get(link.fromId);
+                            const toPlanet = planetById.get(link.toId);
+                            if (!fromPlanet || !toPlanet) return null;
+
+                            const dx = toPlanet.x - fromPlanet.x;
+                            const dy = toPlanet.y - fromPlanet.y;
+                            const length = Math.sqrt(dx * dx + dy * dy);
+                            const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+                            const isSourceSelected = selectedPlanets.some(p => p.id === link.fromId || p.id === link.toId);
+                            const isHoverPath = hoverTarget && selectedPlanets.some((source) => {
+                                const sourceMatches = source.id === link.fromId || source.id === link.toId;
+                                const targetMatches = hoverTarget === link.fromId || hoverTarget === link.toId;
+                                return sourceMatches && targetMatches;
+                            });
+                            const isActive = Boolean(isSourceSelected || isHoverPath);
+
+                            return (
+                                <View
+                                    key={`link-${link.fromId}-${link.toId}`}
+                                    pointerEvents="none"
+                                    style={[
+                                        styles.planetLink,
+                                        isActive ? styles.planetLinkActive : null,
+                                        {
+                                            width: length,
+                                            left: fromPlanet.x,
+                                            top: fromPlanet.y,
+                                            transform: [{ rotate: `${angle}deg` }],
+                                        },
+                                    ]}
+                                />
+                            );
+                        })}
+
+                        {/* Planets */}
+                        {planets.map(planet => (
+                            <Planet
+                                key={planet.id}
+                                x={planet.x}
+                                y={planet.y}
+                                troops={planet.troops}
+                                owner={planet.owner}
+                                size={planet.size}
+                                isBoss={planet.isBoss}
+                                isSelected={primarySelectedPlanet?.id === planet.id || selectedPlanets.some(p => p.id === planet.id)}
+                                isHoverTarget={hoverTarget === planet.id}
+                                hasShield={
+                                    (planet.owner === 'player' && activePowerUps.some(p => p.id === 'shield' && Date.now() < p.expiresAt)) ||
+                                    (protectionCountdown > 0)
+                                }
+                                onPress={() => handlePlanetPress(planet)}
+                                onLongPress={() => handlePlanetLongPress(planet)}
+                                themeColors={currentThemeColors}
+                            />
+                        ))}
 
                     {/* Drag arrow indicator */}
                     {isDragging && dragLine && (
@@ -1087,7 +1252,23 @@ const GameScreen = ({ route, navigation }) => {
                         </View>
                     )}
 
-                    {/* Multi-select indicator */}
+                    <View style={styles.battleHud} pointerEvents="none">
+                        <View style={styles.battleHudLeft}>
+                            <Text style={styles.battleHudTitle}>Saha durumu</Text>
+                            <Text style={styles.battleHudText}>Nötr: {battlefieldStats.neutralPlanets}</Text>
+                            <Text style={styles.battleHudText}>Düşman birlik: {battlefieldStats.enemyTroops}</Text>
+                        </View>
+                        <View style={styles.battleHudRight}>
+                            <Text style={styles.battleHudHint}>
+                                {selectedPlanets.length > 1
+                                    ? `${selectedPlanets.length} gezegen birlesik saldiri icin hazir`
+                                    : primarySelectedPlanet
+                                        ? 'Bir hedef sec veya surukleyerek saldir'
+                                        : 'Bir gezegeni sec, sonra hedefe dokun ya da surukle'}
+                            </Text>
+                        </View>
+                    </View>
+
                     {selectedPlanets.length > 1 && (
                         <View style={styles.multiSelectBadge}>
                             <Text style={styles.multiSelectText}>
@@ -1096,36 +1277,51 @@ const GameScreen = ({ route, navigation }) => {
                         </View>
                     )}
 
-                    {/* Ships */}
-                    {ships.map(ship => (
-                        <Ship
-                            key={ship.id}
-                            fromX={ship.fromX}
-                            fromY={ship.fromY}
-                            toX={ship.toX}
-                            toY={ship.toY}
-                            troops={ship.troops}
-                            owner={ship.owner}
-                            duration={ship.duration}
-                            speedMultiplier={ship.speedMultiplier}
-                            activeShipEmoji={activeShipEmoji}
-                            themeColors={currentThemeColors}
-                            scale={isCustomGame ? 0.7 : 1.0}
-                            onArrival={() => handleShipArrival(ship)}
-                        />
-                    ))}
+                        {/* Ships */}
+                        {ships.map(ship => (
+                            <Ship
+                                key={ship.id}
+                                fromX={ship.fromX}
+                                fromY={ship.fromY}
+                                toX={ship.toX}
+                                toY={ship.toY}
+                                troops={ship.troops}
+                                owner={ship.owner}
+                                duration={ship.duration}
+                                speedMultiplier={ship.speedMultiplier}
+                                activeShipEmoji={activeShipEmoji}
+                                themeColors={currentThemeColors}
+                                scale={isCustomGame ? 0.7 : 1.0}
+                                onArrival={() => handleShipArrival(ship)}
+                            />
+                        ))}
 
-                    {/* Explosions */}
-                    {explosions.map(exp => (
-                        <Explosion
-                            key={exp.id}
-                            x={exp.x}
-                            y={exp.y}
-                            color={exp.color}
-                            size={exp.size}
-                            onComplete={() => removeExplosion(exp.id)}
-                        />
-                    ))}
+                        {/* Explosions */}
+                        {explosions.map(exp => (
+                            <Explosion
+                                key={exp.id}
+                                x={exp.x}
+                                y={exp.y}
+                                color={exp.color}
+                                size={exp.size}
+                                onComplete={() => removeExplosion(exp.id)}
+                            />
+                        ))}
+
+                        {impactFlash && (
+                            <View
+                                pointerEvents="none"
+                                style={[
+                                    styles.impactFlash,
+                                    {
+                                        left: impactFlash.x - 34,
+                                        top: impactFlash.y - 34,
+                                        backgroundColor: impactFlash.color,
+                                    },
+                                ]}
+                            />
+                        )}
+                    </Animated.View>
                 </View>
 
                 {/* Power-up Inventory */}
@@ -1134,15 +1330,6 @@ const GameScreen = ({ route, navigation }) => {
                     onUsePowerUp={usePowerUpFromInventory}
                     disabled={gameState !== 'playing' || showTutorial}
                 />
-
-                {/* Instructions */}
-                <View style={styles.instructions}>
-                    <Text style={styles.instructionText}>
-                        {selectedPlanet
-                            ? '🎯 Hedef gezegene dokun'
-                            : '👆 Kendi gezegenine dokun'}
-                    </Text>
-                </View>
 
                 {/* Tutorial */}
                 {showTutorial && (
@@ -1154,7 +1341,7 @@ const GameScreen = ({ route, navigation }) => {
                     />
                 )}
 
-                {/* Level Intro Tips for first 5 levels */}
+                {/* Level Intro Tips for levels with configured cards */}
                 {showLevelIntro && !showTutorial && (
                     <LevelIntro
                         levelId={levelId}
@@ -1177,17 +1364,44 @@ const GameScreen = ({ route, navigation }) => {
                 {gameState !== 'playing' && (
                     <View style={styles.modalOverlay}>
                         <View style={styles.modalContent}>
+                            <View style={[styles.modalBadge, gameState === 'win' ? styles.modalBadgeWin : styles.modalBadgeLose]}>
+                                <Text style={styles.modalBadgeText}>{gameState === 'win' ? 'SEVIYE TEMIZLENDI' : 'SAVAS KAYBEDILDI'}</Text>
+                            </View>
                             <Text style={styles.modalEmoji}>
-                                {gameState === 'win' ? '🏆' : '💥'}
+                                {gameState === 'win' ? '🏆' : '☄️'}
                             </Text>
                             <Text style={styles.modalTitle}>
-                                {gameState === 'win' ? 'Zafer!' : 'Yenildin!'}
+                                {gameState === 'win' ? 'Zafer senin' : 'Hat tekrar kurulabilir'}
                             </Text>
-                            <Text style={styles.modalScore}>Skor: {score}</Text>
+                            <Text style={styles.modalSubtitle}>
+                                {gameState === 'win'
+                                    ? 'Saha kontrolunu aldin. Simdi baskiyi koruyup bir sonraki duzene gecebilirsin.'
+                                    : 'Bu tur ritim sende degildi. Daha erken merkez kontrolu ve daha net hedef secimi deneyelim.'}
+                            </Text>
+                            <Text style={styles.modalScore}>Skor {score}</Text>
+
+                            <View style={styles.summaryGrid}>
+                                <View style={styles.summaryCard}>
+                                    <Text style={styles.summaryValue}>{gameStats.planetsCaptured}</Text>
+                                    <Text style={styles.summaryLabel}>ele gecirme</Text>
+                                </View>
+                                <View style={styles.summaryCard}>
+                                    <Text style={styles.summaryValue}>{shipsSent}</Text>
+                                    <Text style={styles.summaryLabel}>gemi gonderimi</Text>
+                                </View>
+                                <View style={styles.summaryCard}>
+                                    <Text style={styles.summaryValue}>{battleSummary.elapsedLabel}</Text>
+                                    <Text style={styles.summaryLabel}>sure</Text>
+                                </View>
+                                <View style={styles.summaryCard}>
+                                    <Text style={styles.summaryValue}>%{battleSummary.efficiency}</Text>
+                                    <Text style={styles.summaryLabel}>verim</Text>
+                                </View>
+                            </View>
+
                             <View style={styles.modalStats}>
-                                <Text style={styles.statText}>🌍 {gameStats.planetsCaptured} gezegen</Text>
                                 <Text style={styles.statText}>✨ {gameStats.powerUpsCollected} power-up</Text>
-                                <Text style={styles.statText}>🚀 {shipsSent} gemi</Text>
+                                <Text style={styles.statText}>⚔️ {battlefieldStats.ownedByEnemies} dusman gezegen</Text>
                             </View>
                             <View style={styles.modalButtons}>
                                 <TouchableOpacity
@@ -1227,26 +1441,49 @@ const styles = StyleSheet.create({
         flexDirection: 'row',
         justifyContent: 'space-between',
         alignItems: 'center',
-        paddingHorizontal: 16,
-        paddingVertical: 10,
+        paddingHorizontal: 14,
+        paddingTop: 8,
+        paddingBottom: 6,
     },
     backBtn: {
-        fontSize: 28,
+        fontSize: 26,
         color: theme.colors.white,
         padding: 8,
     },
     headerCenter: {
         alignItems: 'center',
+        backgroundColor: 'rgba(6, 12, 22, 0.58)',
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.08)',
+        borderRadius: 18,
+        paddingHorizontal: 18,
+        paddingVertical: 8,
     },
     levelTitle: {
-        fontSize: 18,
+        fontSize: 17,
         fontWeight: 'bold',
         color: theme.colors.white,
+    },
+    headerStatsRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        marginTop: 4,
     },
     scoreText: {
         fontSize: 14,
         color: theme.colors.gold,
-        marginTop: 2,
+        fontWeight: '700',
+    },
+    headerMiniDivider: {
+        width: 1,
+        height: 12,
+        backgroundColor: 'rgba(255,255,255,0.14)',
+        marginHorizontal: 8,
+    },
+    headerStatChip: {
+        fontSize: 12,
+        color: theme.colors.textDim,
+        marginHorizontal: 4,
     },
     placeholder: {
         width: 44,
@@ -1255,13 +1492,74 @@ const styles = StyleSheet.create({
         flex: 1,
         position: 'relative',
     },
-    instructions: {
-        padding: 16,
-        alignItems: 'center',
+    battlefieldLayer: {
+        ...StyleSheet.absoluteFillObject,
     },
-    instructionText: {
+    impactFlash: {
+        position: 'absolute',
+        width: 68,
+        height: 68,
+        borderRadius: 34,
+        opacity: 0.2,
+        borderWidth: 2,
+        borderColor: 'rgba(255,255,255,0.16)',
+    },
+    battleHud: {
+        position: 'absolute',
+        top: 10,
+        left: 12,
+        right: 12,
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'flex-start',
+        zIndex: 9,
+    },
+    planetLink: {
+        position: 'absolute',
+        height: 2,
+        borderRadius: 999,
+        backgroundColor: 'rgba(158, 184, 255, 0.2)',
+        transformOrigin: 'left center',
+    },
+    planetLinkActive: {
+        backgroundColor: 'rgba(136, 210, 255, 0.85)',
+        shadowColor: '#7fd0ff',
+        shadowOpacity: 0.5,
+        shadowRadius: 4,
+        shadowOffset: { width: 0, height: 0 },
+    },
+    battleHudLeft: {
+        backgroundColor: 'rgba(8, 14, 24, 0.66)',
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.08)',
+        borderRadius: 16,
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+        minWidth: 110,
+    },
+    battleHudRight: {
+        maxWidth: '62%',
+        backgroundColor: 'rgba(8, 14, 24, 0.66)',
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.08)',
+        borderRadius: 16,
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+    },
+    battleHudTitle: {
+        color: theme.colors.white,
+        fontSize: 12,
+        fontWeight: '700',
+        marginBottom: 2,
+    },
+    battleHudText: {
         color: theme.colors.textDim,
-        fontSize: 16,
+        fontSize: 12,
+    },
+    battleHudHint: {
+        color: 'rgba(255,255,255,0.86)',
+        fontSize: 12,
+        lineHeight: 16,
     },
     modalOverlay: {
         ...StyleSheet.absoluteFillObject,
@@ -1270,32 +1568,89 @@ const styles = StyleSheet.create({
         alignItems: 'center',
     },
     modalContent: {
-        backgroundColor: 'rgba(20,20,40,0.95)',
-        padding: 40,
-        borderRadius: 24,
+        backgroundColor: 'rgba(12,16,28,0.96)',
+        paddingHorizontal: 28,
+        paddingVertical: 30,
+        borderRadius: 28,
         alignItems: 'center',
-        borderWidth: 2,
-        borderColor: theme.colors.primary,
-        minWidth: 280,
+        borderWidth: 1.5,
+        borderColor: 'rgba(255,255,255,0.12)',
+        minWidth: 300,
+        maxWidth: 360,
+    },
+    modalBadge: {
+        paddingHorizontal: 12,
+        paddingVertical: 6,
+        borderRadius: 999,
+        marginBottom: 12,
+    },
+    modalBadgeWin: {
+        backgroundColor: 'rgba(34,197,94,0.18)',
+    },
+    modalBadgeLose: {
+        backgroundColor: 'rgba(239,68,68,0.18)',
+    },
+    modalBadgeText: {
+        color: theme.colors.white,
+        fontSize: 11,
+        fontWeight: '800',
+        letterSpacing: 0.8,
     },
     modalEmoji: {
-        fontSize: 64,
+        fontSize: 54,
     },
     modalTitle: {
-        fontSize: 32,
+        fontSize: 28,
         fontWeight: 'bold',
         color: theme.colors.white,
-        marginTop: 16,
+        marginTop: 10,
+    },
+    modalSubtitle: {
+        fontSize: 13,
+        lineHeight: 20,
+        color: theme.colors.textDim,
+        textAlign: 'center',
+        marginTop: 8,
     },
     modalScore: {
-        fontSize: 24,
+        fontSize: 22,
         color: theme.colors.gold,
-        marginTop: 8,
+        marginTop: 14,
+    },
+    summaryGrid: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        justifyContent: 'space-between',
+        marginTop: 18,
+        width: '100%',
+    },
+    summaryCard: {
+        width: '48%',
+        backgroundColor: 'rgba(255,255,255,0.05)',
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.08)',
+        borderRadius: 16,
+        paddingVertical: 14,
+        paddingHorizontal: 12,
+        marginBottom: 10,
+        alignItems: 'center',
+    },
+    summaryValue: {
+        color: theme.colors.white,
+        fontSize: 22,
+        fontWeight: '800',
+    },
+    summaryLabel: {
+        color: theme.colors.textDim,
+        fontSize: 11,
+        marginTop: 4,
+        textTransform: 'uppercase',
+        letterSpacing: 0.5,
     },
     modalStats: {
         flexDirection: 'row',
         flexWrap: 'wrap',
-        marginTop: 12,
+        marginTop: 6,
         justifyContent: 'center',
     },
     statText: {
@@ -1341,44 +1696,46 @@ const styles = StyleSheet.create({
     },
     dragLine: {
         position: 'absolute',
-        height: 5,
-        backgroundColor: '#00d4ff',
-        opacity: 1,
+        height: 4,
+        backgroundColor: '#7ce5ff',
+        opacity: 0.95,
         borderRadius: 3,
-        shadowColor: '#00d4ff',
+        shadowColor: '#7ce5ff',
         shadowOffset: { width: 0, height: 0 },
-        shadowOpacity: 1,
-        shadowRadius: 8,
-        elevation: 10,
+        shadowOpacity: 0.75,
+        shadowRadius: 6,
+        elevation: 8,
         borderWidth: 1,
-        borderColor: 'rgba(255,255,255,0.5)',
+        borderColor: 'rgba(255,255,255,0.22)',
     },
     arrowHead: {
         position: 'absolute',
         width: 0,
         height: 0,
-        borderLeftWidth: 12,
-        borderRightWidth: 12,
-        borderBottomWidth: 20,
+        borderLeftWidth: 10,
+        borderRightWidth: 10,
+        borderBottomWidth: 16,
         borderLeftColor: 'transparent',
         borderRightColor: 'transparent',
-        borderBottomColor: '#00d4ff',
-        opacity: 1,
-        shadowColor: '#00d4ff',
+        borderBottomColor: '#7ce5ff',
+        opacity: 0.96,
+        shadowColor: '#7ce5ff',
         shadowOffset: { width: 0, height: 0 },
-        shadowOpacity: 1,
-        shadowRadius: 8,
-        elevation: 10,
+        shadowOpacity: 0.75,
+        shadowRadius: 6,
+        elevation: 8,
     },
     multiSelectBadge: {
         position: 'absolute',
-        top: 10,
+        top: 84,
         left: '50%',
-        marginLeft: -60,
-        backgroundColor: 'rgba(0, 212, 255, 0.9)',
+        marginLeft: -82,
+        backgroundColor: 'rgba(15, 106, 173, 0.92)',
         paddingHorizontal: 16,
-        paddingVertical: 8,
+        paddingVertical: 9,
         borderRadius: 20,
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.12)',
     },
     multiSelectText: {
         color: theme.colors.white,
@@ -1390,15 +1747,15 @@ const styles = StyleSheet.create({
         marginTop: 4,
     },
     protectionText: {
-        color: '#00d4ff',
-        fontSize: 18,
+        color: '#7ce5ff',
+        fontSize: 15,
         fontWeight: 'bold',
-        textShadowColor: 'rgba(0, 212, 255, 0.8)',
+        textShadowColor: 'rgba(124, 229, 255, 0.55)',
         textShadowOffset: { width: 0, height: 0 },
-        textShadowRadius: 10,
+        textShadowRadius: 6,
     },
     protectionHint: {
-        color: 'rgba(0, 212, 255, 0.9)',
+        color: 'rgba(124, 229, 255, 0.85)',
         fontSize: 12,
         marginTop: 2,
         fontWeight: '600',
