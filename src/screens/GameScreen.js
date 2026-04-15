@@ -38,6 +38,7 @@ import soundManager from '../utils/SoundManager';
 
 const { width, height } = Dimensions.get('window');
 const TUTORIAL_KEY = '@galaxy_conquest_tutorial_done';
+const LEVEL_INTRO_SEEN_PREFIX = '@galaxy_conquest_level_intro_seen_';
 
 const buildLinkKey = (a, b) => [a, b].sort().join('::');
 
@@ -433,9 +434,12 @@ const GameScreen = ({ route, navigation }) => {
                 }
             }
 
-            // Show level intro for levels that have a defined tip card
+            // Show level intro only once per level for configured cards
             if (LEVEL_INTROS[levelId]) {
-                setShowLevelIntro(true);
+                const seenIntro = await AsyncStorage.getItem(`${LEVEL_INTRO_SEEN_PREFIX}${levelId}`);
+                if (!seenIntro) {
+                    setShowLevelIntro(true);
+                }
             }
         };
         checkTutorial();
@@ -1025,6 +1029,11 @@ const GameScreen = ({ route, navigation }) => {
         ProgressManager.markTutorialComplete();
     };
 
+    const handleLevelIntroContinue = useCallback(() => {
+        setShowLevelIntro(false);
+        AsyncStorage.setItem(`${LEVEL_INTRO_SEEN_PREFIX}${levelId}`, 'true');
+    }, [levelId]);
+
     const handleRetry = () => {
         setPlanets(level.planets.map(p => ({ ...p })));
         setGameState('playing');
@@ -1345,7 +1354,7 @@ const GameScreen = ({ route, navigation }) => {
                 {showLevelIntro && !showTutorial && (
                     <LevelIntro
                         levelId={levelId}
-                        onContinue={() => setShowLevelIntro(false)}
+                        onContinue={handleLevelIntroContinue}
                     />
                 )}
 
